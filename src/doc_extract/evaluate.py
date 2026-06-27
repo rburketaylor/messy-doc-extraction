@@ -18,7 +18,9 @@ from jsonschema import Draft202012Validator
 from scipy.optimize import linear_sum_assignment
 
 from doc_extract import canon, config
-from doc_extract.schema import FIELD_TYPE_REGISTRY, INVOICE_JSON_SCHEMA
+from doc_extract.jsonl import load_jsonl, sidecar_manifest_path, write_stage_manifest
+from doc_extract.prompting import format_prompt_for_generation
+from doc_extract.schema import FIELD_TYPE_REGISTRY, INVOICE_JSON_SCHEMA, SCHEMA_VERSION
 
 _VALIDATOR = Draft202012Validator(INVOICE_JSON_SCHEMA)
 _FENCE_RE = re.compile(r"^\s*```(?:json)?|```\s*$", re.MULTILINE)
@@ -339,8 +341,7 @@ def generate(model, processor, prompts, max_new_tokens):
     import torch
     outs = []
     for prompt in prompts:
-        text = processor.apply_chat_template(
-            [{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=False)
+        text = format_prompt_for_generation(processor, prompt)
         inputs = processor(text=text, return_tensors="pt").to(model.device)
         with torch.inference_mode():
             out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
@@ -351,14 +352,9 @@ def generate(model, processor, prompts, max_new_tokens):
 
 def load_records(test_file):
     prompts, golds = [], []
-    with Path(test_file).open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            prompts.append(rec["prompt"])
-            golds.append(json.loads(rec["completion"]))
+    for rec in load_jsonl(test_file):
+        prompts.append(rec["prompt"])
+        golds.append(json.loads(rec["completion"]))
     return prompts, golds
 
 
@@ -366,7 +362,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Evaluate base vs fine-tuned extraction")
     p.add_argument("--test-file", type=Path, default=config.SFT_DIR / "test.jsonl")
     p.add_argument("--base", default=config.STUDENT_MODEL_ID)
-    p.add_argument("--ft", type=Path, default=config.MERGED_DIR)
+    p.add_argument("--ft", default=config.MERGED_DIR)
     p.add_argument("--out", type=Path, default=config.METRICS_PATH)
     p.add_argument("--max-new-tokens", type=int, default=1024)
     args = p.parse_args(argv)
@@ -396,7 +392,23 @@ def main(argv=None):
         "paired_bootstrap_ci_record_exact": ci_re,
         "learning_proven": ci_f1[0] > 0,
     }
-    Path(args.out).write_text(json.dumps(result, indent=2), encoding="utf-8")
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    write_stage_manifest(
+        stage="evaluate",
+        manifest_path=sidecar_manifest_path(out_path),
+        schema_version=SCHEMA_VERSION,
+        seed=config.SEED,
+        counts={"n_records": len(golds)},
+        inputs={"test_jsonl": args.test_file},
+        outputs={"metrics_json": out_path},
+        extra={
+            "base_model": str(args.base),
+            "finetuned_model": str(args.ft),
+            "max_new_tokens": args.max_new_tokens,
+        },
+    )
     print(json.dumps(result, indent=2))
 
 

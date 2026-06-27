@@ -14,12 +14,33 @@ vision-language model (Liquid LFM2.5-VL-1.6B-Extract), and evaluate field-level 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e .[dev]
-export DEEPSEEK_API_KEY=sk-...   # teacher; never commit it
 ```
 
-Requires a CUDA GPU with >=16GB VRAM (developed on a 24GB RTX 3090).
+Set `DEEPSEEK_API_KEY` only when running the teacher-labeling stage:
+
+```bash
+export DEEPSEEK_API_KEY=sk-...   # never commit it
+```
+
+Training/evaluation requires a CUDA GPU with >=16GB VRAM (developed on a 24GB RTX 3090).
 
 ## Run
+
+Fast local checks, no API key or GPU:
+
+```bash
+make check
+make doctor
+```
+
+No-API sample data for inspecting generation/corruption output and manifests:
+
+```bash
+make sample-data SAMPLE_DOCS=20
+ls data/sample
+```
+
+Full API/GPU learning loop:
 
 ```bash
 make data      # generate -> corrupt -> teacher-label (needs DEEPSEEK_API_KEY)
@@ -30,7 +51,18 @@ make all       # the whole loop
 make baseline  # evaluate the base model only (no training)
 ```
 
-Or programmatically: `python -m doc_extract.run_all`.
+The same stages are available through one console command:
+
+```bash
+doc-extract generate --n-docs 20 --out data/sample/clean.jsonl
+doc-extract corrupt --in data/sample/clean.jsonl --out data/sample/dirty.jsonl
+doc-extract label --in data/dirty.jsonl --out data/labeled.jsonl
+doc-extract prepare --in data/labeled.jsonl --out-dir data/sft
+doc-extract doctor
+```
+
+Existing module entrypoints still work, for example `python -m doc_extract.generate` and
+`python -m doc_extract.run_all`.
 
 ## Architecture
 

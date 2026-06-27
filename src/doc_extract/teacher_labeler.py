@@ -19,12 +19,17 @@ from pathlib import Path
 from typing import Any
 
 import openai
-from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from openai import OpenAI
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from doc_extract import config
-from doc_extract.schema import INVOICE_JSON_SCHEMA
+from doc_extract.jsonl import append_jsonl, iter_jsonl, sidecar_manifest_path, write_stage_manifest
+from doc_extract.schema import INVOICE_JSON_SCHEMA, SCHEMA_VERSION
+from doc_extract.validation import (
+    InvoiceValidationError,
+    make_invoice_validator,
+    validate_and_canonicalize_invoice,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +50,7 @@ def _make_client() -> OpenAI:
 
 
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    append_jsonl(path, record, fsync=True)
 
 
 def _load_seen_ids(*paths: Path) -> set[str]:
@@ -125,24 +125,19 @@ def build_messages(dirty_text: str, *, repair_error: str | None = None,
             {"role": "user", "content": "\n\n".join(user_parts)}]
 
 
-def _make_validator() -> Draft202012Validator:
-    Draft202012Validator.check_schema(INVOICE_JSON_SCHEMA)
-    return Draft202012Validator(INVOICE_JSON_SCHEMA, format_checker=FormatChecker())
+def _make_validator():
+    return make_invoice_validator()
 
 
-def _validate_payload(raw_json: str, validator: Draft202012Validator) -> dict[str, Any]:
+def _validate_payload(raw_json: str, validator) -> dict[str, Any]:
     try:
         payload = json.loads(raw_json)
     except json.JSONDecodeError as exc:
         raise SemanticExtractionError(f"Malformed JSON: {exc.msg} at char {exc.pos}") from exc
     try:
-        validator.validate(payload)
-    except ValidationError as exc:
-        raise SemanticExtractionError(f"jsonschema validation failed: {exc.message}") from exc
-    if not isinstance(payload, dict):
-        raise SemanticExtractionError(
-            f"Top-level JSON must be an object, got {type(payload).__name__}")
-    return payload
+        return validate_and_canonicalize_invoice(payload, validator=validator)
+    except InvoiceValidationError as exc:
+        raise SemanticExtractionError(str(exc)) from exc
 
 
 def _call_teacher(client: OpenAI, messages: list[dict[str, str]], *, model: str,
@@ -209,40 +204,53 @@ def extract_invoice_json(*, client: OpenAI, doc_id: str, dirty_text: str,
             raise
 
 
-def label_batch(*, client: OpenAI, in_path: Path, out_path: Path, quarantine_path: Path,
-                model: str, max_tokens: int) -> dict[str, int]:
+def label_batch(
+    *,
+    client: OpenAI,
+    in_path: Path,
+    out_path: Path,
+    quarantine_path: Path,
+    model: str,
+    max_tokens: int,
+    seed: int | None = None,
+) -> dict[str, int]:
     seen = _load_seen_ids(out_path, quarantine_path)
     processed = labeled = quarantined = transport_failed = skipped = 0
-    with Path(in_path).open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            processed += 1
-            rec = json.loads(line)
-            doc_id = str(rec["id"])
-            if doc_id in seen:
-                skipped += 1
-                continue
-            dirty_text = rec["dirty_text"]
-            try:
-                payload = extract_invoice_json(
-                    client=client, doc_id=doc_id, dirty_text=dirty_text,
-                    quarantine_path=quarantine_path, model=model, max_tokens=max_tokens,
-                )
-                _append_jsonl(out_path, {
-                    "id": doc_id, "model": model, "input_text": dirty_text, "output": payload,
-                    "ts": datetime.now(UTC).isoformat(),
-                })
-                seen.add(doc_id)
-                labeled += 1
-            except SemanticExtractionError:
-                seen.add(doc_id)          # quarantined -> don't retry on re-run
-                quarantined += 1
-            except RetryableTransportError:
-                transport_failed += 1     # transient -> leave UNSEEN so a re-run retries it
+    for rec in iter_jsonl(in_path):
+        processed += 1
+        doc_id = str(rec["id"])
+        if doc_id in seen:
+            skipped += 1
+            continue
+        dirty_text = rec["dirty_text"]
+        try:
+            payload = extract_invoice_json(
+                client=client, doc_id=doc_id, dirty_text=dirty_text,
+                quarantine_path=quarantine_path, model=model, max_tokens=max_tokens,
+            )
+            _append_jsonl(out_path, {
+                "id": doc_id, "model": model, "input_text": dirty_text, "output": payload,
+                "ts": datetime.now(UTC).isoformat(),
+            })
+            seen.add(doc_id)
+            labeled += 1
+        except SemanticExtractionError:
+            seen.add(doc_id)          # quarantined -> don't retry on re-run
+            quarantined += 1
+        except RetryableTransportError:
+            transport_failed += 1     # transient -> leave UNSEEN so a re-run retries it
     counts = {"processed": processed, "labeled": labeled, "quarantined": quarantined,
               "transport_failed": transport_failed, "skipped": skipped}
+    write_stage_manifest(
+        stage="label",
+        manifest_path=sidecar_manifest_path(out_path),
+        schema_version=SCHEMA_VERSION,
+        seed=seed,
+        counts=counts,
+        inputs={"dirty_jsonl": in_path},
+        outputs={"labeled_jsonl": out_path, "quarantine_jsonl": quarantine_path},
+        extra={"model": model, "max_tokens": max_tokens},
+    )
     logger.info("label_batch %s", counts)
     return counts
 
@@ -261,8 +269,10 @@ def main(argv=None) -> None:
     client = _make_client()
     counts = label_batch(client=client, in_path=args.inp, out_path=args.out,
                          quarantine_path=args.quarantine, model=args.model,
-                         max_tokens=args.max_tokens)
+                         max_tokens=args.max_tokens, seed=args.seed)
     print(json.dumps(counts))
+    if counts["transport_failed"] > 0:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

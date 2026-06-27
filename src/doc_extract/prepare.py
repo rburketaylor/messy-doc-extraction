@@ -16,7 +16,9 @@ from typing import Any
 from datasets import Dataset
 
 from doc_extract import config
-from doc_extract.schema import SCHEMA_VERSION, Invoice
+from doc_extract.jsonl import load_jsonl, write_jsonl, write_stage_manifest
+from doc_extract.schema import SCHEMA_VERSION
+from doc_extract.validation import InvoiceValidationError, validate_and_canonicalize_invoice
 
 _INSTRUCTION = (
     "Extract the invoice fields from the document below and return ONLY a JSON object matching "
@@ -25,14 +27,7 @@ _INSTRUCTION = (
 
 
 def _load_labeled(in_path: Path) -> list[dict[str, Any]]:
-    rows = []
-    with Path(in_path).open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-    return rows
+    return load_jsonl(in_path)
 
 
 def _filter_valid(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
@@ -40,11 +35,11 @@ def _filter_valid(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int
     for r in rows:
         out = r.get("output")
         try:
-            Invoice(**out)  # re-validate (schema carries pattern/enum)
-        except Exception:
+            canonical = validate_and_canonicalize_invoice(out)
+        except InvoiceValidationError:
             n_filtered += 1
             continue
-        valid.append(r)
+        valid.append({**r, "output": canonical})
     return valid, n_filtered
 
 
@@ -85,19 +80,33 @@ def prepare(in_path: Path, out_dir: Path, seed: int, split: float) -> dict[str, 
 
     train_path = out_dir / "train.jsonl"
     test_path = out_dir / "test.jsonl"
-    for p, data in ((train_path, train_sft), (test_path, test_sft)):
-        with p.open("w", encoding="utf-8") as f:
-            for rec in data:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    write_jsonl(train_path, train_sft)
+    write_jsonl(test_path, test_sft)
 
     _to_hf_dataset(train_sft).save_to_disk(str(out_dir / "train_hf"))
     _to_hf_dataset(test_sft).save_to_disk(str(out_dir / "test_hf"))
 
-    manifest = {
-        "seed": seed, "train_split": split, "n_train": len(train_sft), "n_test": len(test_sft),
-        "n_filtered": n_filtered, "n_loaded": len(rows), "schema_version": SCHEMA_VERSION,
+    counts = {
+        "n_loaded": len(rows),
+        "n_filtered": n_filtered,
+        "n_train": len(train_sft),
+        "n_test": len(test_sft),
     }
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest = write_stage_manifest(
+        stage="prepare",
+        manifest_path=out_dir / "manifest.json",
+        schema_version=SCHEMA_VERSION,
+        seed=seed,
+        counts=counts,
+        inputs={"labeled_jsonl": in_path},
+        outputs={
+            "train_jsonl": train_path,
+            "test_jsonl": test_path,
+            "train_hf": out_dir / "train_hf",
+            "test_hf": out_dir / "test_hf",
+        },
+        extra={"train_split": split, **counts},
+    )
     return manifest
 
 

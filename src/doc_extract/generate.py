@@ -10,15 +10,16 @@ verbatim so extraction is unambiguous.
 from __future__ import annotations
 
 import argparse
-import json
 import random
 from datetime import date, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 from faker import Faker
 
 from doc_extract import config
-from doc_extract.schema import CURRENCIES, Invoice
+from doc_extract.jsonl import sidecar_manifest_path, write_jsonl, write_stage_manifest
+from doc_extract.schema import CURRENCIES, SCHEMA_VERSION, Invoice
 
 UNITS = ["EA", "pcs", "each", "kg", "box", "set", "hr", "m", "L"]
 ITEM_NOUNS = [
@@ -29,10 +30,17 @@ _CURRENCY_SYMBOL = {
     "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "CNY": "¥",
     "CAD": "C$", "AUD": "A$", "INR": "₹",
 }
+_CENT = Decimal("0.01")
+
+
+def _round_money(value: Decimal) -> Decimal:
+    return value.quantize(_CENT, rounding=ROUND_HALF_UP)
 
 
 def _money(rng: random.Random, lo: float, hi: float) -> str:
-    return f"{rng.uniform(lo, hi):.2f}"
+    lo_cents = int(Decimal(str(lo)) * 100)
+    hi_cents = int(Decimal(str(hi)) * 100)
+    return f"{Decimal(rng.randint(lo_cents, hi_cents)) / 100:.2f}"
 
 
 def _quantity(rng: random.Random) -> str:
@@ -48,7 +56,7 @@ def build_clean_invoice(faker: Faker, rng: random.Random) -> dict:
     for _ in range(n_items):
         unit_price = _money(rng, 5, 800)
         q = _quantity(rng)
-        amount = f"{float(q) * float(unit_price):.2f}"
+        amount = f"{_round_money(Decimal(q) * Decimal(unit_price)):.2f}"
         line_items.append({
             "description": f"{faker.word().capitalize()} {rng.choice(ITEM_NOUNS)}".strip(),
             "quantity": q,
@@ -56,10 +64,12 @@ def build_clean_invoice(faker: Faker, rng: random.Random) -> dict:
             "unit_price": unit_price,
             "amount": amount,
         })
-    subtotal = sum(float(li["amount"]) for li in line_items)
-    tax = subtotal * rng.choice([0.0, 0.05, 0.075, 0.10])
-    shipping = rng.choice([0.0, 15.0, 25.0, 45.0])
-    discount = rng.choice([0.0, round(subtotal * 0.02, 2)])
+    subtotal = sum((Decimal(li["amount"]) for li in line_items), Decimal("0.00"))
+    tax = _round_money(subtotal * rng.choice([
+        Decimal("0.00"), Decimal("0.05"), Decimal("0.075"), Decimal("0.10"),
+    ]))
+    shipping = rng.choice([Decimal("0.00"), Decimal("15.00"), Decimal("25.00"), Decimal("45.00")])
+    discount = rng.choice([Decimal("0.00"), _round_money(subtotal * Decimal("0.02"))])
     grand = subtotal + tax + shipping - discount
     inv = {
         "vendor_name": faker.company(),
@@ -180,22 +190,30 @@ TEMPLATES = {
 }
 
 
-def generate(n_docs: int, seed: int, out_path: Path) -> int:
+def _iter_clean_records(n_docs: int, seed: int):
     faker = Faker()
     Faker.seed(seed)
     rng = random.Random(seed)
     template_names = list(TEMPLATES)
+    for i in range(n_docs):
+        inv = build_clean_invoice(faker, rng)
+        tname = rng.choice(template_names)
+        text = TEMPLATES[tname](inv)
+        yield {"id": f"doc-{i:05d}", "clean_json": inv, "clean_text": text, "template": tname}
+
+
+def generate(n_docs: int, seed: int, out_path: Path) -> int:
     out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    n = 0
-    with out_path.open("w", encoding="utf-8") as f:
-        for i in range(n_docs):
-            inv = build_clean_invoice(faker, rng)
-            tname = rng.choice(template_names)
-            text = TEMPLATES[tname](inv)
-            rec = {"id": f"doc-{i:05d}", "clean_json": inv, "clean_text": text, "template": tname}
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            n += 1
+    n = write_jsonl(out_path, _iter_clean_records(n_docs, seed))
+    write_stage_manifest(
+        stage="generate",
+        manifest_path=sidecar_manifest_path(out_path),
+        schema_version=SCHEMA_VERSION,
+        seed=seed,
+        counts={"requested": n_docs, "written": n},
+        outputs={"clean_jsonl": out_path},
+        extra={"templates": sorted(TEMPLATES)},
+    )
     return n
 
 

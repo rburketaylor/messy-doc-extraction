@@ -11,21 +11,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import torch
-from datasets import load_dataset
-from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-from transformers import (
-    AutoModelForImageTextToText,
-    AutoProcessor,
-    BitsAndBytesConfig,
-    set_seed,
-)
-from trl import SFTConfig, SFTTrainer
-
 from doc_extract import config
+from doc_extract.prompting import format_prompt_for_generation
 
 
 def _load_base_4bit(model_id: str, revision: str):
+    import torch
+    from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+
     bnb = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -40,10 +33,19 @@ def _load_base_4bit(model_id: str, revision: str):
     return model, processor
 
 
+def _format_training_example(example: dict[str, str], processor) -> dict[str, str]:
+    return {"prompt": format_prompt_for_generation(processor, example["prompt"])}
+
+
 def train(
     *, train_file: Path, base_id: str, revision: str, adapter_dir: Path,
     epochs: int, seed: int, max_length: int,
 ) -> str:
+    from datasets import load_dataset
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from transformers import set_seed
+    from trl import SFTConfig, SFTTrainer
+
     set_seed(seed, deterministic=True)
     model, processor = _load_base_4bit(base_id, revision)
     model.config.use_cache = False  # required for gradient checkpointing
@@ -59,6 +61,7 @@ def train(
 
     ds = load_dataset("json", data_files=str(train_file), split="train")
     ds = ds.remove_columns([c for c in ds.column_names if c not in ("prompt", "completion")])
+    ds = ds.map(lambda example: _format_training_example(example, processor))
 
     args = SFTConfig(
         output_dir=str(adapter_dir) + "-runs",
@@ -96,6 +99,10 @@ def train(
 
 
 def merge(adapter_dir: Path, base_id: str, revision: str, merged_dir: Path) -> str:
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
     # Merge on a FULL-PRECISION base (4-bit merge is unreliable per research).
     base = AutoModelForImageTextToText.from_pretrained(
         base_id, revision=revision, device_map="auto", dtype=torch.bfloat16,

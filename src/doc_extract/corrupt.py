@@ -8,13 +8,14 @@ a value-token survival check: it rejects value LOSS and value INJECTION (the rea
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import re
 from datetime import datetime
 from pathlib import Path
 
 from doc_extract import canon, config
+from doc_extract.jsonl import iter_jsonl, sidecar_manifest_path, write_jsonl, write_stage_manifest
+from doc_extract.schema import SCHEMA_VERSION
 
 _CURRENCY_SYMBOL = {
     "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "CNY": "¥",
@@ -165,22 +166,30 @@ def apply_corruptions(clean_text, clean_json, rng):
     return text
 
 
+def _iter_dirty_records(in_path: Path, seed: int):
+    for i, rec in enumerate(iter_jsonl(in_path)):
+        rng = random.Random(seed + i)
+        dirty = apply_corruptions(rec["clean_text"], rec["clean_json"], rng)
+        yield {
+            "id": rec["id"],
+            "dirty_text": dirty,
+            "clean_json": rec["clean_json"],
+            "template": rec.get("template"),
+        }
+
+
 def corrupt_file(in_path, out_path, seed):
     in_path, out_path = Path(in_path), Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    n = 0
-    with out_path.open("w", encoding="utf-8") as f:
-        for i, line in enumerate(in_path.open(encoding="utf-8")):
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            rng = random.Random(seed + i)
-            dirty = apply_corruptions(rec["clean_text"], rec["clean_json"], rng)
-            out = {"id": rec["id"], "dirty_text": dirty, "clean_json": rec["clean_json"],
-                   "template": rec.get("template")}
-            f.write(json.dumps(out, ensure_ascii=False) + "\n")
-            n += 1
+    n = write_jsonl(out_path, _iter_dirty_records(in_path, seed))
+    write_stage_manifest(
+        stage="corrupt",
+        manifest_path=sidecar_manifest_path(out_path),
+        schema_version=SCHEMA_VERSION,
+        seed=seed,
+        counts={"written": n},
+        inputs={"clean_jsonl": in_path},
+        outputs={"dirty_jsonl": out_path},
+    )
     return n
 
 

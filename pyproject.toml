@@ -25,6 +25,9 @@ dependencies = [
     "faker>=29,<41",
 ]
 
+[project.scripts]
+doc-extract = "doc_extract.cli:main"
+
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "ruff>=0.6,<1"]
 
@@ -34,6 +37,12 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "slow: slow checks that are skipped by the default make test target",
+    "network: checks that require live network/API access",
+    "gpu: checks that require CUDA/GPU access",
+    "model: checks that load or run ML models",
+]
 
 [tool.ruff]
 line-length = 100
