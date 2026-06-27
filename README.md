@@ -16,11 +16,14 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e .[dev]
 ```
 
-Set `DEEPSEEK_API_KEY` only when running the teacher-labeling stage:
+Set `DEEPSEEK_API_KEY` only when running the teacher-labeling stage. The CLI automatically loads
+a repo-root `.env` file if present:
 
 ```bash
-export DEEPSEEK_API_KEY=sk-...   # never commit it
+printf "DEEPSEEK_API_KEY=sk-...\n" > .env   # never commit it
 ```
+
+Shell environment values take precedence over `.env` values.
 
 Training/evaluation requires a CUDA GPU with >=16GB VRAM (developed on a 24GB RTX 3090).
 
