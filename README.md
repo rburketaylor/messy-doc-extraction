@@ -54,6 +54,17 @@ make all       # the whole loop
 make baseline  # evaluate the base model only (no training)
 ```
 
+Active-learning LiquidAI base-vs-extract study:
+
+```bash
+make active-data                         # generate/corrupt/split; no DeepSeek calls
+make active-label MAX_TEACHER_LABELS=100 # mine hard cases, teacher-label only those, build SFT
+make train-general                       # fine-tune LiquidAI/LFM2.5-VL-1.6B
+make train-extract                       # fine-tune LiquidAI/LFM2.5-VL-1.6B-Extract
+make compare                             # writes artifacts/comparison_metrics.json
+make active-demo                         # full active workflow with N_DOCS=500 by default
+```
+
 The same stages are available through one console command:
 
 ```bash
@@ -61,6 +72,10 @@ doc-extract generate --n-docs 20 --out data/sample/clean.jsonl
 doc-extract corrupt --in data/sample/clean.jsonl --out data/sample/dirty.jsonl
 doc-extract label --in data/dirty.jsonl --out data/labeled.jsonl
 doc-extract prepare --in data/labeled.jsonl --out-dir data/sft
+doc-extract split-gold --in data/dirty.jsonl
+doc-extract mine-failures --max-labels 100
+doc-extract prepare-active
+doc-extract compare
 doc-extract doctor
 ```
 

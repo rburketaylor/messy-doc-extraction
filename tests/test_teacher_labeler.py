@@ -31,6 +31,8 @@ _VALID = {
     }],
 }
 
+_USAGE = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+
 
 def _write_dirty(path, ids):
     with path.open("w", encoding="utf-8") as f:
@@ -141,8 +143,8 @@ def test_extract_repairs_after_first_semantic_failure(tmp_path, monkeypatch):
     def fake_call_teacher_retry(client, messages, *, model, max_tokens):
         calls.append(messages)
         if len(calls) == 1:
-            return "{not json"
-        return json.dumps(_VALID)
+            return "{not json", _USAGE
+        return json.dumps(_VALID), _USAGE
 
     monkeypatch.setattr(teacher_labeler, "_call_teacher_retry", fake_call_teacher_retry)
 
@@ -165,7 +167,7 @@ def test_extract_repairs_after_first_semantic_failure(tmp_path, monkeypatch):
 
 
 def test_extract_quarantine_payload_contains_failure_context(tmp_path, monkeypatch):
-    outputs = iter(["{not json", "{also bad"])
+    outputs = iter([("{not json", _USAGE), ("{also bad", _USAGE)])
 
     def fake_call_teacher_retry(client, messages, *, model, max_tokens):
         return next(outputs)
@@ -239,3 +241,116 @@ def test_transport_error_propagates_without_quarantine(tmp_path, monkeypatch):
         )
 
     assert not quarantine_path.exists()
+
+
+def test_call_teacher_returns_content_and_usage():
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=json.dumps(_VALID)),
+                    )
+                ],
+                usage=SimpleNamespace(
+                    prompt_tokens=100, completion_tokens=20, total_tokens=120
+                ),
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    content, usage = teacher_labeler._call_teacher(client, [], model="teacher", max_tokens=128)
+    assert json.loads(content)["vendor_name"] == "Acme"
+    assert usage == {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+
+
+def test_call_teacher_treats_missing_usage_as_zeros():
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=json.dumps(_VALID)),
+                    )
+                ],
+            )  # no .usage attribute on the response
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    _content, usage = teacher_labeler._call_teacher(client, [], model="teacher", max_tokens=128)
+    assert usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+def test_extract_invoice_json_logs_usage_for_each_call(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_call_teacher_retry(client, messages, *, model, max_tokens):
+        calls.append(messages)
+        if len(calls) == 1:  # first attempt fails semantically
+            return "{not json", {"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13}
+        return json.dumps(_VALID), {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16}
+
+    monkeypatch.setattr(teacher_labeler, "_call_teacher_retry", fake_call_teacher_retry)
+    usage_log: list = []
+
+    teacher_labeler.extract_invoice_json(
+        client=object(),
+        doc_id="doc-0",
+        dirty_text="invoice text",
+        quarantine_path=tmp_path / "quarantine.jsonl",
+        model="teacher",
+        max_tokens=128,
+        usage_log=usage_log,
+    )
+
+    assert len(usage_log) == 2
+    assert usage_log[0]["prompt_tokens"] == 11
+    assert usage_log[1]["total_tokens"] == 16
+
+
+def test_label_batch_aggregates_token_usage_by_outcome(tmp_path, monkeypatch):
+    in_path = tmp_path / "dirty.jsonl"
+    out_path = tmp_path / "labeled.jsonl"
+    quarantine_path = tmp_path / "quarantine.jsonl"
+    _write_dirty(in_path, ["ok", "bad"])
+
+    def fake_extract_invoice_json(**kwargs):
+        if kwargs["doc_id"] == "bad":
+            # two calls' worth of usage before the semantic failure
+            kwargs["usage_log"].append(
+                {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+            )
+            kwargs["usage_log"].append(
+                {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
+            )
+            teacher_labeler._append_jsonl(kwargs["quarantine_path"], {"id": "bad", "error": "x"})
+            raise teacher_labeler.SemanticExtractionError("bad json")
+        kwargs["usage_log"].append(
+            {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+        )
+        return _VALID
+
+    monkeypatch.setattr(teacher_labeler, "extract_invoice_json", fake_extract_invoice_json)
+
+    counts = teacher_labeler.label_batch(
+        client=object(),
+        in_path=in_path,
+        out_path=out_path,
+        quarantine_path=quarantine_path,
+        model="teacher",
+        max_tokens=128,
+    )
+
+    tu = counts["token_usage"]
+    assert counts["labeled"] == 1
+    assert counts["quarantined"] == 1
+    assert tu["labeled"] == {
+        "api_calls": 1, "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120
+    }
+    assert tu["quarantined"] == {
+        "api_calls": 2, "prompt_tokens": 15, "completion_tokens": 5, "total_tokens": 20
+    }
+    assert tu["total"]["api_calls"] == 3
+    assert tu["total"]["total_tokens"] == 140
+    manifest = json.loads(sidecar_manifest_path(out_path).read_text(encoding="utf-8"))
+    assert manifest["counts"]["token_usage"]["total"]["api_calls"] == 3

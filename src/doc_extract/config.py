@@ -54,7 +54,11 @@ DEFAULT_N_DOCS = 500
 TRAIN_SPLIT = 0.9
 
 # --- Model ids (research-verified) ---
-STUDENT_MODEL_ID = "LiquidAI/LFM2.5-VL-1.6B-Extract"
+GENERAL_MODEL_ID = "LiquidAI/LFM2.5-VL-1.6B"
+EXTRACT_MODEL_ID = "LiquidAI/LFM2.5-VL-1.6B-Extract"
+
+# Backwards-compatible default for the original single-student pipeline.
+STUDENT_MODEL_ID = EXTRACT_MODEL_ID
 # "main" for an iterative learning run; for a strictly reproducible run, capture the resolved
 # commit SHA (model.config._commit_hash at load time) into the split manifest and pin it here.
 STUDENT_REVISION = "main"
@@ -78,7 +82,15 @@ ARTIFACTS_DIR = REPO_ROOT / "artifacts"
 CHECKPOINT_DIR = ARTIFACTS_DIR / "checkpoints"
 ADAPTER_DIR = CHECKPOINT_DIR / "adapter"
 MERGED_DIR = CHECKPOINT_DIR / "merged"
+GENERAL_CHECKPOINT_DIR = CHECKPOINT_DIR / "general"
+GENERAL_ADAPTER_DIR = GENERAL_CHECKPOINT_DIR / "adapter"
+GENERAL_MERGED_DIR = GENERAL_CHECKPOINT_DIR / "merged"
+EXTRACT_CHECKPOINT_DIR = CHECKPOINT_DIR / "extract"
+EXTRACT_ADAPTER_DIR = EXTRACT_CHECKPOINT_DIR / "adapter"
+EXTRACT_MERGED_DIR = EXTRACT_CHECKPOINT_DIR / "merged"
 METRICS_PATH = ARTIFACTS_DIR / "metrics.json"
+COMPARISON_METRICS_PATH = ARTIFACTS_DIR / "comparison_metrics.json"
+PREDICTIONS_DIR = ARTIFACTS_DIR / "predictions"
 
 # Stage data files
 CLEAN_JSONL = DATA_DIR / "clean.jsonl"
@@ -86,9 +98,36 @@ DIRTY_JSONL = DATA_DIR / "dirty.jsonl"
 LABELED_JSONL = DATA_DIR / "labeled.jsonl"
 QUARANTINE_JSONL = DATA_DIR / "quarantine.jsonl"
 SFT_DIR = DATA_DIR / "sft"
+ACTIVE_DIR = DATA_DIR / "active"
+TRAIN_POOL_JSONL = ACTIVE_DIR / "train_pool.jsonl"
+TEST_GOLD_JSONL = ACTIVE_DIR / "test_gold.jsonl"
+HARD_CASES_JSONL = ACTIVE_DIR / "hard_cases.jsonl"
+HARD_LABELED_JSONL = ACTIVE_DIR / "hard_labeled.jsonl"
+HARD_QUARANTINE_JSONL = ACTIVE_DIR / "hard_quarantine.jsonl"
+ACTIVE_SFT_DIR = ACTIVE_DIR / "sft"
+
+GOLD_TRAIN_SPLIT = 0.8
+MAX_TEACHER_LABELS = 100
+HARD_PER_EASY = 2
 
 
 def ensure_dirs() -> None:
     """Create all output directories. Safe to call repeatedly."""
-    for p in (DATA_DIR, ARTIFACTS_DIR, CHECKPOINT_DIR, ADAPTER_DIR, MERGED_DIR, SFT_DIR):
+    for p in (
+        DATA_DIR,
+        ARTIFACTS_DIR,
+        CHECKPOINT_DIR,
+        ADAPTER_DIR,
+        MERGED_DIR,
+        SFT_DIR,
+        GENERAL_CHECKPOINT_DIR,
+        GENERAL_ADAPTER_DIR,
+        GENERAL_MERGED_DIR,
+        EXTRACT_CHECKPOINT_DIR,
+        EXTRACT_ADAPTER_DIR,
+        EXTRACT_MERGED_DIR,
+        PREDICTIONS_DIR,
+        ACTIVE_DIR,
+        ACTIVE_SFT_DIR,
+    ):
         p.mkdir(parents=True, exist_ok=True)

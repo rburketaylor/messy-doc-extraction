@@ -26,6 +26,10 @@ _INSTRUCTION = (
 )
 
 
+def format_extraction_prompt(input_text: str) -> str:
+    return _INSTRUCTION + "\n\nDOCUMENT:\n" + input_text
+
+
 def _load_labeled(in_path: Path) -> list[dict[str, Any]]:
     return load_jsonl(in_path)
 
@@ -57,7 +61,7 @@ def _split(valid: list[dict[str, Any]], seed: int, split: float) -> tuple[list, 
 def _to_sft(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
     out = []
     for r in rows:
-        prompt = _INSTRUCTION + "\n\nDOCUMENT:\n" + r["input_text"]
+        prompt = format_extraction_prompt(r["input_text"])
         completion = json.dumps(r["output"], ensure_ascii=False)  # strict JSON, no fences
         out.append({"id": str(r["id"]), "prompt": prompt, "completion": completion})
     return out

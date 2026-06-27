@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from doc_extract import (
+    active,
     config,
     corrupt,
     doctor,
@@ -97,6 +99,82 @@ def _run_baseline(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_split_gold(args: argparse.Namespace) -> int:
+    manifest = active.split_gold(
+        in_path=args.inp,
+        train_out=args.train_out,
+        test_out=args.test_out,
+        seed=args.seed,
+        split=args.split,
+    )
+    print(json.dumps(manifest))
+    return 0
+
+
+def _run_predict(args: argparse.Namespace) -> int:
+    manifest = active.predict(
+        input_path=args.inp,
+        out_path=args.out,
+        run_name=args.run,
+        model_path=args.model_path,
+        max_new_tokens=args.max_new_tokens,
+    )
+    print(json.dumps(manifest))
+    return 0
+
+
+def _run_mine_failures(args: argparse.Namespace) -> int:
+    manifest = active.mine_failures(
+        train_pool_path=args.train_pool,
+        general_predictions_path=args.general_predictions,
+        extract_predictions_path=args.extract_predictions,
+        out_path=args.out,
+        max_labels=args.max_labels,
+    )
+    print(json.dumps(manifest))
+    return 0
+
+
+def _run_label_hard(args: argparse.Namespace) -> int:
+    client = teacher_labeler._make_client()
+    counts = active.label_hard_batch(
+        client=client,
+        in_path=args.inp,
+        out_path=args.out,
+        quarantine_path=args.quarantine,
+        model=args.model,
+        max_tokens=args.max_tokens,
+        max_labels=args.max_labels,
+        seed=args.seed,
+    )
+    print(json.dumps(counts))
+    return 1 if counts["transport_failed"] > 0 else 0
+
+
+def _run_prepare_active(args: argparse.Namespace) -> int:
+    manifest = active.prepare_active_sft(
+        train_pool_path=args.train_pool,
+        hard_labels_path=args.hard_labels,
+        test_gold_path=args.test_gold,
+        out_dir=args.out_dir,
+        seed=args.seed,
+        hard_per_easy=args.hard_per_easy,
+    )
+    print(json.dumps(manifest))
+    return 0
+
+
+def _run_compare(args: argparse.Namespace) -> int:
+    result = active.compare_runs(
+        test_file=args.test_file,
+        hard_file=args.hard_file,
+        out_path=args.out,
+        max_new_tokens=args.max_new_tokens,
+    )
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def _run_all(args: argparse.Namespace) -> int:
     run_all.run_all(n_docs=args.n_docs, seed=args.seed)
     return 0
@@ -167,6 +245,64 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, default=config.METRICS_PATH)
     p.add_argument("--max-new-tokens", type=int, default=1024)
     p.set_defaults(func=_run_baseline)
+
+    p = sub.add_parser("split-gold", help="split dirty docs into train pool and frozen gold test")
+    p.add_argument("--in", dest="inp", type=Path, default=config.DIRTY_JSONL)
+    p.add_argument("--train-out", type=Path, default=config.TRAIN_POOL_JSONL)
+    p.add_argument("--test-out", type=Path, default=config.TEST_GOLD_JSONL)
+    p.add_argument("--seed", type=int, default=config.DATA_SEED)
+    p.add_argument("--split", type=float, default=config.GOLD_TRAIN_SPLIT)
+    p.set_defaults(func=_run_split_gold)
+
+    p = sub.add_parser("predict", help="write raw model predictions for an active-learning run")
+    p.add_argument("--in", dest="inp", type=Path, default=config.TRAIN_POOL_JSONL)
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--run", choices=sorted(active.model_run_specs()), required=True)
+    p.add_argument("--model-path", default=None)
+    p.add_argument("--max-new-tokens", type=int, default=1024)
+    p.set_defaults(func=_run_predict)
+
+    p = sub.add_parser("mine-failures", help="rank hard train-pool records from base predictions")
+    p.add_argument("--train-pool", type=Path, default=config.TRAIN_POOL_JSONL)
+    p.add_argument(
+        "--general-predictions",
+        type=Path,
+        default=config.PREDICTIONS_DIR / "base_general_train_pool.jsonl",
+    )
+    p.add_argument(
+        "--extract-predictions",
+        type=Path,
+        default=config.PREDICTIONS_DIR / "base_extract_train_pool.jsonl",
+    )
+    p.add_argument("--out", type=Path, default=config.HARD_CASES_JSONL)
+    p.add_argument("--max-labels", type=int, default=config.MAX_TEACHER_LABELS)
+    p.set_defaults(func=_run_mine_failures)
+
+    p = sub.add_parser("label-hard", help="DeepSeek-label mined hard cases with truth checks")
+    p.add_argument("--in", dest="inp", type=Path, default=config.HARD_CASES_JSONL)
+    p.add_argument("--out", type=Path, default=config.HARD_LABELED_JSONL)
+    p.add_argument("--quarantine", type=Path, default=config.HARD_QUARANTINE_JSONL)
+    p.add_argument("--model", default=config.TEACHER_MODEL_ID)
+    p.add_argument("--seed", type=int, default=config.SEED)
+    p.add_argument("--max-tokens", type=int, default=config.TEACHER_MAX_TOKENS)
+    p.add_argument("--max-labels", type=int, default=config.MAX_TEACHER_LABELS)
+    p.set_defaults(func=_run_label_hard)
+
+    p = sub.add_parser("prepare-active", help="build active SFT data from hard and easy labels")
+    p.add_argument("--train-pool", type=Path, default=config.TRAIN_POOL_JSONL)
+    p.add_argument("--hard-labels", type=Path, default=config.HARD_LABELED_JSONL)
+    p.add_argument("--test-gold", type=Path, default=config.TEST_GOLD_JSONL)
+    p.add_argument("--out-dir", type=Path, default=config.ACTIVE_SFT_DIR)
+    p.add_argument("--seed", type=int, default=config.DATA_SEED)
+    p.add_argument("--hard-per-easy", type=int, default=config.HARD_PER_EASY)
+    p.set_defaults(func=_run_prepare_active)
+
+    p = sub.add_parser("compare", help="evaluate the four-run LiquidAI comparison matrix")
+    p.add_argument("--test-file", type=Path, default=config.TEST_GOLD_JSONL)
+    p.add_argument("--hard-file", type=Path, default=config.HARD_CASES_JSONL)
+    p.add_argument("--out", type=Path, default=config.COMPARISON_METRICS_PATH)
+    p.add_argument("--max-new-tokens", type=int, default=1024)
+    p.set_defaults(func=_run_compare)
 
     p = sub.add_parser("run-all", help="run the full API/GPU learning loop")
     p.add_argument("--n-docs", type=int, default=config.DEFAULT_N_DOCS)

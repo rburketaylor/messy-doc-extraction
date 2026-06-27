@@ -140,8 +140,20 @@ def _validate_payload(raw_json: str, validator) -> dict[str, Any]:
         raise SemanticExtractionError(str(exc)) from exc
 
 
+def _usage_from_response(resp: Any) -> dict[str, int]:
+    """Safely extract token usage from a chat completion response (zeros if absent)."""
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return {
+        "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+        "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+    }
+
+
 def _call_teacher(client: OpenAI, messages: list[dict[str, str]], *, model: str,
-                  max_tokens: int) -> str:
+                  max_tokens: int) -> tuple[str, dict[str, int]]:
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -166,7 +178,7 @@ def _call_teacher(client: OpenAI, messages: list[dict[str, str]], *, model: str,
     content = choice.message.content or ""
     if not content.strip():
         raise SemanticExtractionError("Empty assistant content on HTTP 200")
-    return content
+    return content, _usage_from_response(resp)
 
 
 _call_teacher_retry = retry(
@@ -178,21 +190,26 @@ _call_teacher_retry = retry(
 
 
 def extract_invoice_json(*, client: OpenAI, doc_id: str, dirty_text: str,
-                         quarantine_path: Path, model: str, max_tokens: int) -> dict[str, Any]:
+                         quarantine_path: Path, model: str, max_tokens: int,
+                         usage_log: list[dict[str, int]] | None = None) -> dict[str, Any]:
     validator = _make_validator()
     raw = ""
     try:
-        raw = _call_teacher_retry(client, build_messages(dirty_text),
-                                  model=model, max_tokens=max_tokens)
+        raw, usage = _call_teacher_retry(client, build_messages(dirty_text),
+                                         model=model, max_tokens=max_tokens)
+        if usage_log is not None:
+            usage_log.append(usage)
         return _validate_payload(raw, validator)
     except SemanticExtractionError as first_err:
         raw2 = ""
         try:
-            raw2 = _call_teacher_retry(
+            raw2, usage2 = _call_teacher_retry(
                 client,
                 build_messages(dirty_text, repair_error=str(first_err), bad_output=raw),
                 model=model, max_tokens=max_tokens,
             )
+            if usage_log is not None:
+                usage_log.append(usage2)
             return _validate_payload(raw2, validator)
         except SemanticExtractionError as second_err:
             _append_jsonl(quarantine_path, {
@@ -204,6 +221,23 @@ def extract_invoice_json(*, client: OpenAI, doc_id: str, dirty_text: str,
             raise
 
 
+_USAGE_KEYS = ("api_calls", "prompt_tokens", "completion_tokens", "total_tokens")
+
+
+def new_usage_totals() -> dict[str, int]:
+    """Fresh per-bucket token-usage accumulator."""
+    return {key: 0 for key in _USAGE_KEYS}
+
+
+def accumulate_usage(totals: dict[str, int], calls: list[dict[str, int]]) -> None:
+    """Fold a record's per-call usage list into a totals bucket, in place."""
+    totals["api_calls"] += len(calls)
+    for call in calls:
+        totals["prompt_tokens"] += int(call.get("prompt_tokens", 0))
+        totals["completion_tokens"] += int(call.get("completion_tokens", 0))
+        totals["total_tokens"] += int(call.get("total_tokens", 0))
+
+
 def label_batch(
     *,
     client: OpenAI,
@@ -213,9 +247,12 @@ def label_batch(
     model: str,
     max_tokens: int,
     seed: int | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     seen = _load_seen_ids(out_path, quarantine_path)
     processed = labeled = quarantined = transport_failed = skipped = 0
+    total_usage = new_usage_totals()
+    labeled_usage = new_usage_totals()
+    quarantined_usage = new_usage_totals()
     for rec in iter_jsonl(in_path):
         processed += 1
         doc_id = str(rec["id"])
@@ -223,10 +260,12 @@ def label_batch(
             skipped += 1
             continue
         dirty_text = rec["dirty_text"]
+        rec_usage: list[dict[str, int]] = []
         try:
             payload = extract_invoice_json(
                 client=client, doc_id=doc_id, dirty_text=dirty_text,
                 quarantine_path=quarantine_path, model=model, max_tokens=max_tokens,
+                usage_log=rec_usage,
             )
             _append_jsonl(out_path, {
                 "id": doc_id, "model": model, "input_text": dirty_text, "output": payload,
@@ -234,13 +273,20 @@ def label_batch(
             })
             seen.add(doc_id)
             labeled += 1
+            accumulate_usage(labeled_usage, rec_usage)
+            accumulate_usage(total_usage, rec_usage)
         except SemanticExtractionError:
             seen.add(doc_id)          # quarantined -> don't retry on re-run
             quarantined += 1
+            accumulate_usage(quarantined_usage, rec_usage)
+            accumulate_usage(total_usage, rec_usage)
         except RetryableTransportError:
             transport_failed += 1     # transient -> leave UNSEEN so a re-run retries it
+            accumulate_usage(total_usage, rec_usage)
     counts = {"processed": processed, "labeled": labeled, "quarantined": quarantined,
-              "transport_failed": transport_failed, "skipped": skipped}
+              "transport_failed": transport_failed, "skipped": skipped,
+              "token_usage": {"total": total_usage, "labeled": labeled_usage,
+                              "quarantined": quarantined_usage}}
     write_stage_manifest(
         stage="label",
         manifest_path=sidecar_manifest_path(out_path),
