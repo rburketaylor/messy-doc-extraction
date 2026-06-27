@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import importlib.util
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -69,8 +70,11 @@ def _check_import() -> list[CheckResult]:
         )
         return out
 
-    direct_url = (dist.read_text("direct_url.json") or "").lower()
-    if '"editable": true' in direct_url:
+    try:
+        direct_url = json.loads(dist.read_text("direct_url.json") or "{}")
+    except json.JSONDecodeError:
+        direct_url = {}
+    if direct_url.get("dir_info", {}).get("editable") is True:
         out.append(_result("editable install", "ok", "installed editable"))
     else:
         out.append(_result("editable install", "warn", "installed package is not editable"))
