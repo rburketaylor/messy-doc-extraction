@@ -10,6 +10,7 @@ from datetime import datetime
 import pytest
 
 from doc_extract import canon, corrupt, generate
+from doc_extract.jsonl import sidecar_manifest_path
 
 _DATE_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}|\d{1,2} [A-Za-z]{3} \d{4}|\d{1,2}/\d{1,2}/\d{4}"
@@ -88,6 +89,10 @@ def test_dirty_jsonl_carries_gold(clean_records, tmp_path):
             f.write(json.dumps(r) + "\n")
     n = corrupt.corrupt_file(clean_path, dirty_path, 42)
     assert n == len(clean_records)
+    manifest = json.loads(sidecar_manifest_path(dirty_path).read_text(encoding="utf-8"))
+    assert manifest["stage"] == "corrupt"
+    assert manifest["counts"] == {"written": len(clean_records)}
+    assert set(manifest["file_hashes"]) == {"inputs", "outputs"}
     rows = [json.loads(line) for line in dirty_path.open(encoding="utf-8")]
     assert len(rows) == len(clean_records)
     for r in rows:

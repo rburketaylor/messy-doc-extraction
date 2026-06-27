@@ -1,7 +1,8 @@
-"""Phase 5: deterministic split reproducibility + invalid filtering."""
+"""Phase 5: deterministic split reproducibility, canonicalization, and invalid filtering."""
 
 from __future__ import annotations
 
+import copy
 import json
 
 from doc_extract import prepare
@@ -32,12 +33,21 @@ def _ids(path):
 def test_filter_and_split(tmp_path):
     labeled = tmp_path / "labeled.jsonl"
     rows = [_row(i, dict(_VALID, invoice_number=f"INV-{i}")) for i in range(10)]
-    rows.append(_row(99, dict(_VALID, invoice_date="25/06/2026")))   # invalid -> filtered
-    rows.append(_row(98, dict(_VALID, currency="XYZ")))              # invalid -> filtered
+    rows.append(_row(99, dict(_VALID, invoice_date="25/06/2026")))   # invalid shape
+    rows.append(_row(98, dict(_VALID, currency="XYZ")))              # invalid enum
+    rows.append(_row(97, dict(_VALID, discount_total="-1.00")))      # uncanonicalizable amount
+    rows.append(_row(96, dict(_VALID, grand_total="N/A")))           # unparseable amount
+    word_qty = copy.deepcopy(_VALID)
+    word_qty["line_items"][0]["quantity"] = "two"
+    rows.append(_row(95, word_qty))                                  # unparseable quantity
+    rows.append(_row(94, dict(_VALID, invoice_date="2026-02-31")))   # impossible date
     _write_labeled(labeled, rows)
 
     m = prepare.prepare(labeled, tmp_path / "out1", seed=42, split=0.8)
-    assert m["n_filtered"] == 2
+    assert m["stage"] == "prepare"
+    assert m["n_filtered"] == 6
+    assert m["counts"]["n_filtered"] == 6
+    assert m["inputs"]["labeled_jsonl"] == str(labeled)
     assert m["n_train"] + m["n_test"] == 10
     train1, test1 = tmp_path / "out1" / "train.jsonl", tmp_path / "out1" / "test.jsonl"
     train_ids, test_ids = _ids(train1), _ids(test1)
@@ -65,3 +75,35 @@ def test_completions_are_strict_json(tmp_path):
     parsed = json.loads(rec["completion"])  # strict JSON, parses
     assert parsed["vendor_name"] == "Acme"
     assert not rec["completion"].lstrip().startswith("```")  # no markdown fence
+
+
+def test_completion_uses_canonicalized_label(tmp_path):
+    labeled = tmp_path / "labeled.jsonl"
+    messy = copy.deepcopy(_VALID)
+    messy.update({
+        "vendor_name": "  Acme   Corp  ",
+        "subtotal": "USD 1,000",
+        "grand_total": "$1,000.0",
+    })
+    messy["line_items"][0].update({
+        "description": "  Widget   labor ",
+        "quantity": "2.00",
+        "unit": "each",
+        "unit_price": "$500",
+        "amount": "1,000.0",
+    })
+    _write_labeled(labeled, [_row(0, messy)])
+
+    m = prepare.prepare(labeled, tmp_path / "o", seed=42, split=1.0)
+    assert m["n_filtered"] == 0
+    rec = json.loads(next((tmp_path / "o" / "train.jsonl").open(encoding="utf-8")))
+    parsed = json.loads(rec["completion"])
+
+    assert parsed["vendor_name"] == "Acme Corp"
+    assert parsed["subtotal"] == "1000.00"
+    assert parsed["grand_total"] == "1000.00"
+    assert parsed["line_items"][0]["description"] == "Widget labor"
+    assert parsed["line_items"][0]["quantity"] == "2"
+    assert parsed["line_items"][0]["unit"] == "EA"
+    assert parsed["line_items"][0]["unit_price"] == "500.00"
+    assert parsed["line_items"][0]["amount"] == "1000.00"
